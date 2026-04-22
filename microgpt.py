@@ -48,6 +48,13 @@ class Value:
     def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
     def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
     def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
+        def tanh(self):
+    t = math.tanh(self.data)
+    return Value(t, (self,), (1 - t * t,))
+
+def gelu(self):
+    c = math.sqrt(2 / math.pi)
+    return 0.5 * self * (1 + (c * (self + 0.044715 * self**3)).tanh())
     def __neg__(self): return self * -1
     def __radd__(self, other): return self + other
     def __sub__(self, other): return self + (-other)
@@ -80,6 +87,30 @@ head_dim = n_embd // n_head # derived dimension of each head
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
 for i in range(n_layer):
+    n_experts = 2
+state_dict[f'layer{i}.moe_gate'] = matrix(n_experts, n_embd)
+for e in range(n_experts):
+    state_dict[f'layer{i}.moe_fc1_{e}'] = matrix(4 * n_embd, n_embd)
+    state_dict[f'layer{i}.moe_fc2_{e}'] = matrix(n_embd, 4 * n_embd)
+def moe_block(x, li):
+    gate_logits = linear(x, state_dict[f'layer{li}.moe_gate'])
+    gate_probs = softmax(gate_logits)
+
+    expert_outputs = []
+    for e in range(2):
+        h = linear(x, state_dict[f'layer{li}.moe_fc1_{e}'])
+        h = [xi.gelu() for xi in h]
+        h = linear(h, state_dict[f'layer{li}.moe_fc2_{e}'])
+        expert_outputs.append(h)
+
+    out = []
+    for j in range(len(x)):
+        val = sum(gate_probs[e] * expert_outputs[e][j] for e in range(2))
+        out.append(val)
+    return out
+    r = 4
+state_dict[f'layer{i}.attn_wq_lora_A'] = matrix(n_embd, r)
+state_dict[f'layer{i}.attn_wq_lora_B'] = matrix(r, n_embd)
     state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
@@ -92,6 +123,10 @@ print(f"num params: {len(params)}")
 # Define the model architecture: a function mapping tokens and parameters to logits over what comes next
 # Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
 def linear(x, w):
+    def lora_linear(x, w, a, b, alpha=1.0):
+    base = linear(x, w)
+    low_rank = linear(linear(x, b), a)
+    return [u + alpha * v for u, v in zip(base, low_rank)]
     return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
 
 def softmax(logits):
@@ -104,6 +139,18 @@ def rmsnorm(x):
     ms = sum(xi * xi for xi in x) / len(x)
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
+    def rope(vec, pos, head_dim):
+    half = head_dim // 2
+    out = []
+    for i in range(half):
+        theta = pos / (10000 ** (2 * i / head_dim))
+        c = math.cos(theta)
+        s = math.sin(theta)
+        x1 = vec[i]
+        x2 = vec[i + half]
+        out.append(x1 * c - x2 * s)
+        out.append(x1 * s + x2 * c)
+    return out
 
 def gpt(token_id, pos_id, keys, values):
     tok_emb = state_dict['wte'][token_id] # token embedding
@@ -115,9 +162,16 @@ def gpt(token_id, pos_id, keys, values):
         # 1) Multi-head Attention block
         x_residual = x
         x = rmsnorm(x)
-        q = linear(x, state_dict[f'layer{li}.attn_wq'])
+        q = lora_linear(
+            x,
+            state_dict[f'layer{li}.attn_wq'],
+            state_dict[f'layer{li}.attn_wq_lora_A'],
+            state_dict[f'layer{li}.attn_wq_lora_B'],
+        )
         k = linear(x, state_dict[f'layer{li}.attn_wk'])
         v = linear(x, state_dict[f'layer{li}.attn_wv'])
+        q = rope(q, pos_id, head_dim)
+        k = rope(k, pos_id, head_dim)
         keys[li].append(k)
         values[li].append(v)
         x_attn = []
@@ -133,12 +187,10 @@ def gpt(token_id, pos_id, keys, values):
         x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
         x = [a + b for a, b in zip(x, x_residual)]
         # 2) MLP block
-        x_residual = x
-        x = rmsnorm(x)
-        x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
-        x = [xi.relu() for xi in x]
-        x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
-        x = [a + b for a, b in zip(x, x_residual)]
+       x_residual = x
+x = rmsnorm(x)
+x = moe_block(x, li)
+x = [a + b for a, b in zip(x, x_residual)]
 
     logits = linear(x, state_dict['lm_head'])
     return logits
