@@ -48,6 +48,12 @@ class Value:
     def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
     def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
     def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
+    def tanh(self):
+        t = math.tanh(self.data)
+        return Value(t, (self,), (1 - t * t,))
+    def gelu(self):
+        c = math.sqrt(2 / math.pi)
+        return 0.5 * self * (1 + (c * (self + 0.044715 * self**3)).tanh())
     def __neg__(self): return self * -1
     def __radd__(self, other): return self + other
     def __sub__(self, other): return self + (-other)
@@ -136,7 +142,7 @@ def gpt(token_id, pos_id, keys, values):
         x_residual = x
         x = rmsnorm(x)
         x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
-        x = [xi.relu() for xi in x]
+        x = [xi.gelu() for xi in x]
         x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
         x = [a + b for a, b in zip(x, x_residual)]
 
