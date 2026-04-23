@@ -110,7 +110,25 @@ def rmsnorm(x):
     ms = sum(xi * xi for xi in x) / len(x)
     scale = (ms + 1e-5) ** -0.5
     return [xi * scale for xi in x]
+def rope_one(vec, pos, head_dim):
+    half = head_dim // 2
+    out = []
+    for i in range(half):
+        theta = pos / (10000 ** (2 * i / head_dim))
+        c = math.cos(theta)
+        s = math.sin(theta)
+        x1 = vec[i]
+        x2 = vec[i + half]
+        out.append(x1 * c - x2 * s)
+        out.append(x1 * s + x2 * c)
+    return out
 
+def apply_rope(x, pos, n_head, head_dim):
+    out = []
+    for h in range(n_head):
+        hs = h * head_dim
+        out.extend(rope_one(x[hs:hs + head_dim], pos, head_dim))
+    return out
 def gpt(token_id, pos_id, keys, values):
     tok_emb = state_dict['wte'][token_id] # token embedding
     pos_emb = state_dict['wpe'][pos_id] # position embedding
@@ -124,6 +142,9 @@ def gpt(token_id, pos_id, keys, values):
         q = linear(x, state_dict[f'layer{li}.attn_wq'])
         k = linear(x, state_dict[f'layer{li}.attn_wk'])
         v = linear(x, state_dict[f'layer{li}.attn_wv'])
+        
+        q = apply_rope(q, pos_id, n_head, head_dim)
+        k = apply_rope(k, pos_id, n_head, head_dim)
         keys[li].append(k)
         values[li].append(v)
         x_attn = []
